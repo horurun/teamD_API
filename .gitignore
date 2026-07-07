@@ -1,0 +1,12 @@
+# 仮想環境
+.venv/
+venv/
+pyvenv.cfg
+
+# キャッシュ
+__pycache__/
+*.pyc
+
+# データベースファイル
+*.db
+*.sqlite3
