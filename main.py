@@ -136,7 +136,7 @@ def vehicle_entry(data: EntryRequest):
 
 
 # ==========================================
-# API 2: /canExit (退場可能かどうかの事前判定)
+# API 2: /canExit (退場可能かどうかの事前判定 ＋ 可能ならそのまま退場処理)
 # ==========================================
 @app.post("/canExit")
 def check_can_exit(data: CanExitRequest):
@@ -144,42 +144,78 @@ def check_can_exit(data: CanExitRequest):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
+        result_msg = ""
+        should_exit = False  # 退場処理を行うかどうかのフラグ
+        
+        # db2 (事前許可証) をチェック
         cursor.execute("SELECT id FROM db2_pre_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
         if cursor.fetchone():
-            conn.close()
-            return {"status": "success", "result": "事前許可証あり"}
-            
-        cursor.execute("SELECT id FROM db3_temp_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
-        if cursor.fetchone():
-            conn.close()
-            return {"status": "success", "result": "一時許可証あり"}
-            
-        cursor.execute("""
-            SELECT entry_time FROM db1_parking_logs 
-            WHERE car_number = ? AND status != '退出済み' 
-            ORDER BY id DESC LIMIT 1
-        """, (data.car_number,))
-        row = cursor.fetchone()
+            result_msg = "事前許可証あり"
+            should_exit = True
+        else:
+            # db3 (一時許可証) をチェック
+            cursor.execute("SELECT id FROM db3_temp_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
+            if cursor.fetchone():
+                result_msg = "一時許可証あり"
+                should_exit = True
+            else:
+                # 許可証がない場合、db1 から入場時間を取り出して時間計算を行う
+                cursor.execute("""
+                    SELECT entry_time FROM db1_parking_logs 
+                    WHERE car_number = ? AND status != '退出済み' 
+                    ORDER BY id DESC LIMIT 1
+                """, (data.car_number,))
+                row = cursor.fetchone()
+                
+                # db1に入場記録すらない場合 (予期せぬエラーケース)
+                if not row:
+                    conn.close()
+                    return {"status": "error", "message": "入場記録が見つかりません"}
+                    
+                # 滞在時間の計算
+                entry_time_str = row[0]
+                time_format = "%Y-%m-%d %H:%M:%S"
+                entry_dt = datetime.strptime(entry_time_str, time_format)
+                exit_dt = datetime.strptime(data.time, time_format)
+                
+                duration_minutes = (exit_dt - entry_dt).total_seconds() / 60
+                
+                # 時間内か時間外かを判定
+                if duration_minutes <= FREE_TIME_LIMIT_MINUTES:
+                    result_msg = "許可証なしかつ時間内"
+                    should_exit = True
+                else:
+                    result_msg = "許可証なしかつ時間外"
+                    should_exit = False
         
-        if not row:
-            conn.close()
-            return {"status": "error", "message": "入場記録が見つかりません"}
+        # ==========================================
+        # ここから追加：退場条件を満たしている場合のみ、データベースを更新する
+        # ==========================================
+        if should_exit:
+            # db1 のナンバーの車を「退出済み」にする
+            cursor.execute("""
+                UPDATE db1_parking_logs 
+                SET status = '退出済み' 
+                WHERE car_number = ? AND status != '退出済み'
+            """, (data.car_number,))
             
-        entry_time_str = row[0]
-        time_format = "%Y-%m-%d %H:%M:%S"
-        entry_dt = datetime.strptime(entry_time_str, time_format)
-        exit_dt = datetime.strptime(data.time, time_format)
-        
-        duration_minutes = (exit_dt - entry_dt).total_seconds() / 60
+            # db3 に一時許可証があれば「無効」にする
+            cursor.execute("""
+                UPDATE db3_temp_permits 
+                SET status = '無効' 
+                WHERE car_number = ? AND status = '有効'
+            """, (data.car_number,))
+            
+            # 変更を保存
+            conn.commit()
+            
         conn.close()
         
-        if duration_minutes <= FREE_TIME_LIMIT_MINUTES:
-            return {"status": "success", "result": "許可証なしかつ時間内"}
-        else:
-            return {"status": "success", "result": "許可証なしかつ時間外"}
+        # 判定結果を返す（APIの戻り値の形は今まで通り）
+        return {"status": "success", "result": result_msg}
             
     except Exception as e:
-        return {"status": "error", "message": f"判定失敗: {str(e)}"}
+        return {"status": "error", "message": f"判定・退場処理失敗: {str(e)}"}
 
 
 # ==========================================
