@@ -115,7 +115,7 @@ class QRCheckRequest(BaseModel):
     QRnumber: str
 
 # ==========================================
-# API 1: /entry (入ってきた車の登録)
+# API 1: /entry (入ってきた車の登録 ＋ 重複時の上書き機能)
 # ==========================================
 @app.post("/entry")
 def vehicle_entry(data: EntryRequest):
@@ -123,6 +123,7 @@ def vehicle_entry(data: EntryRequest):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
+        # 1. まず、許可証の状況を確認して登録するステータスを決定する
         cursor.execute("SELECT id FROM db2_pre_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
         has_pre_permit = cursor.fetchone() is not None
         
@@ -136,16 +137,40 @@ def vehicle_entry(data: EntryRequest):
         else:
             status = "未許可滞在中"
             
+        # 2. 既に「退出済み」ではない（＝現在滞在中の）同じ車の記録があるかチェックする
         cursor.execute("""
-            INSERT INTO db1_parking_logs (car_number, entry_time, status)
-            VALUES (?, ?, ?)
-        """, (data.car_number, data.time, status))
+            SELECT id FROM db1_parking_logs 
+            WHERE car_number = ? AND status != '退出済み'
+        """, (data.car_number,))
+        
+        existing_record = cursor.fetchone()
+        
+        if existing_record:
+            # 3A. 既に滞在中の記録があれば、新しい時間とステータスで「上書き」する
+            cursor.execute("""
+                UPDATE db1_parking_logs 
+                SET entry_time = ?, status = ? 
+                WHERE car_number = ? AND status != '退出済み'
+            """, (data.time, status, data.car_number))
+            message = "既存の入場記録を新しい情報で上書きしました"
+            
+        else:
+            # 3B. 滞在中の記録がなければ、通常通り「新規登録」する
+            cursor.execute("""
+                INSERT INTO db1_parking_logs (car_number, entry_time, status)
+                VALUES (?, ?, ?)
+            """, (data.car_number, data.time, status))
+            message = "入場記録を保存しました"
         
         conn.commit()
         conn.close()
         
-        return {"status": "success", "message": "入場記録を保存しました", "recorded_status": status}
+        return {"status": "success", "message": message, "recorded_status": status}
+        
     except Exception as e:
+        # 万が一エラーが起きた場合も確実にDBを閉じる
+        if 'conn' in locals():
+            conn.close()
         return {"status": "error", "message": f"登録失敗: {str(e)}"}
 
 # ==========================================
