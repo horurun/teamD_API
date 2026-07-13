@@ -3,22 +3,42 @@ from pydantic import BaseModel
 import sqlite3
 from datetime import datetime
 from typing import Optional
-
+import requests  # HTTP通信用に追加
 from fastapi.middleware.cors import CORSMiddleware
+
+# config.py からゲートサーバーのURLを読み込む
+try:
+    from config import GATE_SERVER_URL
+except ImportError:
+    # ファイルがない場合のフォールバック（エラー防止）
+    GATE_SERVER_URL = "http://192.168.4.2:8000"
 
 app = FastAPI(title="駐車場管理システム API")
 
 app.add_middleware(
-CORSMiddleware,
-allow_origins=["*"],
-allow_credentials=True,
-allow_methods=["*"],
-allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- 設定値 ---
 FREE_TIME_LIMIT_MINUTES = 60
 DB_FILE = "parking_system.db"
+
+# ==========================================
+# ゲート開放APIを叩く共通関数
+# ==========================================
+def open_gate():
+    try:
+        url = f"{GATE_SERVER_URL}/updatePermit"
+        payload = {"status": "OPEN"}
+        # タイムアウトを短め（3秒）に設定し、ゲートサーバーが落ちていてもこちらのシステムが止まらないようにする
+        response = requests.post(url, json=payload, timeout=3)
+        print(f"ゲート開放要求を送信しました: HTTP {response.status_code}")
+    except Exception as e:
+        print(f"ゲート開放要求に失敗しました: {e}")
 
 # ==========================================
 # データベースの初期設定
@@ -27,7 +47,6 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # db1: 駐車中の車の管理 (変更なし)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS db1_parking_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +56,6 @@ def init_db():
         )
     """)
     
-    # db2: 事前に発行される駐車場使用許可証の管理 (QRnumberを追加)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS db2_pre_permits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +68,6 @@ def init_db():
         )
     """)
     
-    # db3: 一時駐車場許可証の管理 (QRnumber, userStatusを追加)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS db3_temp_permits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +84,6 @@ def init_db():
 
 init_db()
 
-
 # ==========================================
 # データ構造の定義 (Pydantic Models)
 # ==========================================
@@ -82,7 +98,6 @@ class CanExitRequest(BaseModel):
 class ExitRequest(BaseModel):
     car_number: str
 
-# (変更) QRnumber (int) を追加
 class PrePermitRequest(BaseModel):
     car_number: str
     owner_name: str
@@ -90,7 +105,6 @@ class PrePermitRequest(BaseModel):
     allowed_parking_lot: int
     QRnumber: str
 
-# (変更) QRnumber (int) と userStatus (str) を追加
 class TempPermitRequest(BaseModel):
     car_number: str
     entry_time: str
@@ -134,7 +148,6 @@ def vehicle_entry(data: EntryRequest):
     except Exception as e:
         return {"status": "error", "message": f"登録失敗: {str(e)}"}
 
-
 # ==========================================
 # API 2: /canExit (退場可能かどうかの事前判定 ＋ 可能ならそのまま退場処理)
 # ==========================================
@@ -145,21 +158,18 @@ def check_can_exit(data: CanExitRequest):
         cursor = conn.cursor()
         
         result_msg = ""
-        should_exit = False  # 退場処理を行うかどうかのフラグ
+        should_exit = False
         
-        # db2 (事前許可証) をチェック
         cursor.execute("SELECT id FROM db2_pre_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
         if cursor.fetchone():
             result_msg = "事前許可証あり"
             should_exit = True
         else:
-            # db3 (一時許可証) をチェック
             cursor.execute("SELECT id FROM db3_temp_permits WHERE car_number = ? AND status = '有効'", (data.car_number,))
             if cursor.fetchone():
                 result_msg = "一時許可証あり"
                 should_exit = True
             else:
-                # 許可証がない場合、db1 から入場時間を取り出して時間計算を行う
                 cursor.execute("""
                     SELECT entry_time FROM db1_parking_logs 
                     WHERE car_number = ? AND status != '退出済み' 
@@ -167,12 +177,10 @@ def check_can_exit(data: CanExitRequest):
                 """, (data.car_number,))
                 row = cursor.fetchone()
                 
-                # db1に入場記録すらない場合 (予期せぬエラーケース)
                 if not row:
                     conn.close()
                     return {"status": "error", "message": "入場記録が見つかりません"}
                     
-                # 滞在時間の計算
                 entry_time_str = row[0]
                 time_format = "%Y-%m-%d %H:%M:%S"
                 entry_dt = datetime.strptime(entry_time_str, time_format)
@@ -180,7 +188,6 @@ def check_can_exit(data: CanExitRequest):
                 
                 duration_minutes = (exit_dt - entry_dt).total_seconds() / 60
                 
-                # 時間内か時間外かを判定
                 if duration_minutes <= FREE_TIME_LIMIT_MINUTES:
                     result_msg = "許可証なしかつ時間内"
                     should_exit = True
@@ -188,35 +195,29 @@ def check_can_exit(data: CanExitRequest):
                     result_msg = "許可証なしかつ時間外"
                     should_exit = False
         
-        # ==========================================
-        # ここから追加：退場条件を満たしている場合のみ、データベースを更新する
-        # ==========================================
         if should_exit:
-            # db1 のナンバーの車を「退出済み」にする
             cursor.execute("""
                 UPDATE db1_parking_logs 
                 SET status = '退出済み' 
                 WHERE car_number = ? AND status != '退出済み'
             """, (data.car_number,))
             
-            # db3 に一時許可証があれば「無効」にする
             cursor.execute("""
                 UPDATE db3_temp_permits 
                 SET status = '無効' 
                 WHERE car_number = ? AND status = '有効'
             """, (data.car_number,))
             
-            # 変更を保存
             conn.commit()
             
+            # DBの退場処理が確定したらゲートを開ける
+            open_gate()
+            
         conn.close()
-        
-        # 判定結果を返す（APIの戻り値の形は今まで通り）
         return {"status": "success", "result": result_msg}
             
     except Exception as e:
         return {"status": "error", "message": f"判定・退場処理失敗: {str(e)}"}
-
 
 # ==========================================
 # API 3: /exit (車の退場処理)
@@ -242,10 +243,12 @@ def vehicle_exit(data: ExitRequest):
         conn.commit()
         conn.close()
         
+        # 手動・強制退場時にもゲートを開ける
+        open_gate()
+        
         return {"status": "success", "message": "退場処理が完了しました"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
 
 # ==========================================
 # API 4: /issuePrePermit (事前許可証の発行)
@@ -261,7 +264,6 @@ def issue_pre_permit(data: PrePermitRequest):
             conn.close()
             return {"status": "error", "message": "既に有効な事前許可証が登録されています"}
             
-        # (変更) INSERT文に QRnumber を追加
         cursor.execute("""
             INSERT INTO db2_pre_permits (car_number, owner_name, user_type, allowed_parking_lot, QRnumber, status)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -273,7 +275,6 @@ def issue_pre_permit(data: PrePermitRequest):
         return {"status": "success", "message": "事前許可証を発行・登録しました"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
 
 # ==========================================
 # API 5: /issueTempPermit (一時許可証の発行)
@@ -289,7 +290,6 @@ def issue_temp_permit(data: TempPermitRequest):
             conn.close()
             return {"status": "error", "message": "既に有効な一時許可証が登録されています"}
             
-        # (変更) INSERT文に QRnumber と userStatus を追加
         cursor.execute("""
             INSERT INTO db3_temp_permits (car_number, entry_time, QRnumber, userStatus, status)
             VALUES (?, ?, ?, ?, ?)
@@ -301,7 +301,6 @@ def issue_temp_permit(data: TempPermitRequest):
         return {"status": "success", "message": "一時許可証を発行・登録しました"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
 
 # ==========================================
 # API 6: /getPermits (現在有効な事前許可証の取得)
@@ -320,7 +319,6 @@ def get_permits():
         return {"status": "success", "permits": [dict(row) for row in rows]}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
 
 # ==========================================
 # API 7: /getTemporaryPermits (現在有効な一時許可証の取得)
@@ -364,11 +362,9 @@ def get_all_cars():
 @app.post("/checkQR")
 def check_qr_permit(data: QRCheckRequest):
     try:
-        # 1. データベースに接続
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # 2. まず「事前許可証 (db2_pre_permits)」のテーブルから検索
         cursor.execute("""
             SELECT car_number FROM db2_pre_permits 
             WHERE QRnumber = ? AND status = '有効'
@@ -376,13 +372,8 @@ def check_qr_permit(data: QRCheckRequest):
         
         pre_permit = cursor.fetchone()
         
-        # ------------------------------------------------
-        # [パターンA] 有効な事前許可証が見つかった場合
-        # ------------------------------------------------
         if pre_permit:
             car_number = pre_permit[0]
-            
-            # db1 (駐車中ログ) の該当車両を「退出済み」に更新する
             cursor.execute("""
                 UPDATE db1_parking_logs 
                 SET status = '退出済み' 
@@ -390,6 +381,10 @@ def check_qr_permit(data: QRCheckRequest):
             """, (car_number,))
             
             conn.commit()
+            
+            # QRコード（事前許可証）で退場条件を満たしたためゲートを開ける
+            open_gate()
+            
             conn.close()
             return {
                 "status": "success",
@@ -398,7 +393,6 @@ def check_qr_permit(data: QRCheckRequest):
                 "message": "有効な事前許可証として認識し、退場処理を完了しました"
             }
             
-        # 3. 事前許可証になければ、次に「一時許可証 (db3_temp_permits)」のテーブルを検索
         cursor.execute("""
             SELECT car_number FROM db3_temp_permits 
             WHERE QRnumber = ? AND status = '有効'
@@ -406,20 +400,15 @@ def check_qr_permit(data: QRCheckRequest):
         
         temp_permit = cursor.fetchone()
         
-        # ------------------------------------------------
-        # [パターンB] 有効な一時許可証が見つかった場合
-        # ------------------------------------------------
         if temp_permit:
             car_number = temp_permit[0]
             
-            # 1. db1 (駐車中ログ) の該当車両を「退出済み」に更新する
             cursor.execute("""
                 UPDATE db1_parking_logs 
                 SET status = '退出済み' 
                 WHERE car_number = ? AND status != '退出済み'
             """, (car_number,))
             
-            # 2. db3 (一時許可証) の該当許可証を「無効」に更新する（使い捨てにする）
             cursor.execute("""
                 UPDATE db3_temp_permits 
                 SET status = '無効' 
@@ -427,6 +416,10 @@ def check_qr_permit(data: QRCheckRequest):
             """, (data.QRnumber,))
             
             conn.commit()
+            
+            # QRコード（一時許可証）で退場条件を満たしたためゲートを開ける
+            open_gate()
+            
             conn.close()
             return {
                 "status": "success",
@@ -435,9 +428,6 @@ def check_qr_permit(data: QRCheckRequest):
                 "message": "有効な一時許可証として認識し、退場処理を完了しました（許可証は無効化されました）"
             }
             
-        # ------------------------------------------------
-        # [パターンC] どちらのテーブルにも「有効」な状態で存在しない場合
-        # ------------------------------------------------
         conn.close()
         return {
             "status": "error",
@@ -445,7 +435,6 @@ def check_qr_permit(data: QRCheckRequest):
         }
         
     except Exception as e:
-        # エラー発生時の処理（DBを確実に閉じる）
         if 'conn' in locals():
             conn.close()
         return {"status": "error", "message": f"データベース照会エラー: {str(e)}"}

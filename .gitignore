@@ -10,3 +10,6 @@ __pycache__/
 # データベースファイル
 *.db
 *.sqlite3
+
+# 設定ファイル
+config.py
