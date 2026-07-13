@@ -359,7 +359,7 @@ def get_all_cars():
         return {"status": "error", "message": str(e)}
 
 # ==========================================
-# API 9: /checkQR (QRコードからの許可証判別)
+# API 9: /checkQR (QRコードからの許可証判別 ＋ 自動退場処理)
 # ==========================================
 @app.post("/checkQR")
 def check_qr_permit(data: QRCheckRequest):
@@ -369,7 +369,6 @@ def check_qr_permit(data: QRCheckRequest):
         cursor = conn.cursor()
         
         # 2. まず「事前許可証 (db2_pre_permits)」のテーブルから検索
-        # QRnumberが一致し、かつステータスが「有効」なものを探す
         cursor.execute("""
             SELECT car_number FROM db2_pre_permits 
             WHERE QRnumber = ? AND status = '有効'
@@ -377,17 +376,29 @@ def check_qr_permit(data: QRCheckRequest):
         
         pre_permit = cursor.fetchone()
         
-        # もし見つかったら、事前許可証であると返す
+        # ------------------------------------------------
+        # [パターンA] 有効な事前許可証が見つかった場合
+        # ------------------------------------------------
         if pre_permit:
+            car_number = pre_permit[0]
+            
+            # db1 (駐車中ログ) の該当車両を「退出済み」に更新する
+            cursor.execute("""
+                UPDATE db1_parking_logs 
+                SET status = '退出済み' 
+                WHERE car_number = ? AND status != '退出済み'
+            """, (car_number,))
+            
+            conn.commit()
             conn.close()
             return {
                 "status": "success",
                 "permit_type": "事前許可証",
-                "car_number": pre_permit[0],
-                "message": "有効な事前許可証として認識しました"
+                "car_number": car_number,
+                "message": "有効な事前許可証として認識し、退場処理を完了しました"
             }
             
-        # 3. 事前許可証になければ、次に「一時許可証 (db3_temp_permits)」のテーブルを検索[cite: 2]
+        # 3. 事前許可証になければ、次に「一時許可証 (db3_temp_permits)」のテーブルを検索
         cursor.execute("""
             SELECT car_number FROM db3_temp_permits 
             WHERE QRnumber = ? AND status = '有効'
@@ -395,17 +406,38 @@ def check_qr_permit(data: QRCheckRequest):
         
         temp_permit = cursor.fetchone()
         
-        # もし見つかったら、一時許可証であると返す
+        # ------------------------------------------------
+        # [パターンB] 有効な一時許可証が見つかった場合
+        # ------------------------------------------------
         if temp_permit:
+            car_number = temp_permit[0]
+            
+            # 1. db1 (駐車中ログ) の該当車両を「退出済み」に更新する
+            cursor.execute("""
+                UPDATE db1_parking_logs 
+                SET status = '退出済み' 
+                WHERE car_number = ? AND status != '退出済み'
+            """, (car_number,))
+            
+            # 2. db3 (一時許可証) の該当許可証を「無効」に更新する（使い捨てにする）
+            cursor.execute("""
+                UPDATE db3_temp_permits 
+                SET status = '無効' 
+                WHERE QRnumber = ? AND status = '有効'
+            """, (data.QRnumber,))
+            
+            conn.commit()
             conn.close()
             return {
                 "status": "success",
                 "permit_type": "一時許可証",
-                "car_number": temp_permit[0],
-                "message": "有効な一時許可証として認識しました"
+                "car_number": car_number,
+                "message": "有効な一時許可証として認識し、退場処理を完了しました（許可証は無効化されました）"
             }
             
-        # 4. どちらのテーブルにも「有効」な状態で存在しない場合
+        # ------------------------------------------------
+        # [パターンC] どちらのテーブルにも「有効」な状態で存在しない場合
+        # ------------------------------------------------
         conn.close()
         return {
             "status": "error",
