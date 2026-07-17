@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # --- 設定値 ---
-FREE_TIME_LIMIT_MINUTES = 60
+FREE_TIME_LIMIT_MINUTES = 3
 DB_FILE = "parking_system.db"
 
 # ==========================================
