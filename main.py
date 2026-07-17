@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 import requests  # HTTP通信用に追加
+import threading # ★裏側で秒数をカウントするために追加
 from fastapi.middleware.cors import CORSMiddleware
 
 # config.py からゲートサーバーのURLを読み込む
@@ -26,9 +27,22 @@ app.add_middleware(
 # --- 設定値 ---
 FREE_TIME_LIMIT_MINUTES = 3
 DB_FILE = "parking_system.db"
+GATE_CLOSE_DELAY_SECONDS = 10  # ★ゲートを開けてから閉めるまでの秒数（ここで自由に変更できます）
 
 # ==========================================
-# ゲート開放APIを叩く共通関数
+# ゲート閉鎖APIを叩く関数 (新規追加)
+# ==========================================
+def close_gate():
+    try:
+        url = f"{GATE_SERVER_URL}/updatePermit"
+        payload = {"status": "CLOSE"}
+        response = requests.post(url, json=payload, timeout=3)
+        print(f"ゲート閉鎖要求を送信しました: HTTP {response.status_code}")
+    except Exception as e:
+        print(f"ゲート閉鎖要求に失敗しました: {e}")
+
+# ==========================================
+# ゲート開放APIを叩く共通関数 (修正)
 # ==========================================
 def open_gate():
     try:
@@ -37,6 +51,12 @@ def open_gate():
         # タイムアウトを短め（3秒）に設定し、ゲートサーバーが落ちていてもこちらのシステムが止まらないようにする
         response = requests.post(url, json=payload, timeout=3)
         print(f"ゲート開放要求を送信しました: HTTP {response.status_code}")
+        
+        # ★ゲート開放の通信に成功した場合、裏側でタイマーを起動して指定秒数後に close_gate を実行する
+        timer = threading.Timer(GATE_CLOSE_DELAY_SECONDS, close_gate)
+        timer.start()
+        print(f"{GATE_CLOSE_DELAY_SECONDS}秒後に自動でゲートを閉鎖します...")
+        
     except Exception as e:
         print(f"ゲート開放要求に失敗しました: {e}")
 
@@ -113,6 +133,9 @@ class TempPermitRequest(BaseModel):
     
 class QRCheckRequest(BaseModel):
     QRnumber: str
+    
+class DeletePermitRequest(BaseModel):
+    car_number: str
 
 # ==========================================
 # API 1: /entry (入ってきた車の登録 ＋ 重複時の上書き機能)
@@ -463,3 +486,53 @@ def check_qr_permit(data: QRCheckRequest):
         if 'conn' in locals():
             conn.close()
         return {"status": "error", "message": f"データベース照会エラー: {str(e)}"}
+
+# ==========================================
+# API 10: /deletePermit (指定した車の許可証をすべて無効化)
+# ==========================================
+@app.post("/deletePermit")
+def delete_permit(data: DeletePermitRequest):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # db2 (事前許可証) の「有効」なデータを「無効」に更新
+        cursor.execute("""
+            UPDATE db2_pre_permits 
+            SET status = '無効' 
+            WHERE car_number = ? AND status = '有効'
+        """, (data.car_number,))
+        db2_updated = cursor.rowcount  # 更新された件数を取得
+        
+        # db3 (一時許可証) の「有効」なデータを「無効」に更新
+        cursor.execute("""
+            UPDATE db3_temp_permits 
+            SET status = '無効' 
+            WHERE car_number = ? AND status = '有効'
+        """, (data.car_number,))
+        db3_updated = cursor.rowcount  # 更新された件数を取得
+        
+        conn.commit()
+        conn.close()
+        
+        # 合計で何件更新されたかを計算
+        total_updated = db2_updated + db3_updated
+        
+        # 1件以上更新されていれば成功、0件なら該当なしと判定
+        if total_updated > 0:
+            return {
+                "status": "success",
+                "message": f"指定された車番（{data.car_number}）の許可証をすべて無効化しました",
+                "invalidated_count": total_updated
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "無効化する有効な許可証が存在しません"
+            }
+            
+    except Exception as e:
+        # エラー発生時の処理（DBを確実に閉じる）
+        if 'conn' in locals():
+            conn.close()
+        return {"status": "error", "message": f"無効化処理エラー: {str(e)}"}
